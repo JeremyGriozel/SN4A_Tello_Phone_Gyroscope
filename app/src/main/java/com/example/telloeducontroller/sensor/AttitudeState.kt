@@ -49,7 +49,8 @@ fun rememberAttitudeState(): AttitudeHandle {
 
         val rotation = currentDisplayRotation(context)
         val rotationMatrix = FloatArray(9)
-        val remappedMatrix = FloatArray(9)
+        val screenMatrix = FloatArray(9)
+        val verticalMatrix = FloatArray(9)
         val orientationRad = FloatArray(3)
 
         var rollOffset = 0f
@@ -66,8 +67,17 @@ fun rememberAttitudeState(): AttitudeHandle {
                     Surface.ROTATION_270 -> SensorManager.AXIS_MINUS_Y to SensorManager.AXIS_X
                     else -> SensorManager.AXIS_X to SensorManager.AXIS_Y
                 }
-                SensorManager.remapCoordinateSystem(rotationMatrix, axisX, axisY, remappedMatrix)
-                SensorManager.getOrientation(remappedMatrix, orientationRad)
+                SensorManager.remapCoordinateSystem(rotationMatrix, axisX, axisY, screenMatrix)
+
+                // getOrientation() suppose l'appareil posé à plat, écran vers le ciel : dans cette
+                // convention, tenir le téléphone verticalement (écran face à soi, comme on le fait
+                // pour piloter en regardant l'écran) place le tangage proche de 90° et fait entrer
+                // le calcul en gimbal lock (roulis et lacet se mélangent, deviennent erratiques). On
+                // remappe l'axe Z (perpendiculaire à l'écran) sur Y pour que "à plat" corresponde à
+                // cette prise en main verticale, ce qui déplace la singularité loin de la zone de
+                // pilotage normale.
+                SensorManager.remapCoordinateSystem(screenMatrix, SensorManager.AXIS_X, SensorManager.AXIS_Z, verticalMatrix)
+                SensorManager.getOrientation(verticalMatrix, orientationRad)
 
                 val yaw = Math.toDegrees(orientationRad[0].toDouble()).toFloat()
                 val pitch = Math.toDegrees(orientationRad[1].toDouble()).toFloat()

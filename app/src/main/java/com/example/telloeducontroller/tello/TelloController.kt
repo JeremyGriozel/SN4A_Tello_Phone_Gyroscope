@@ -25,6 +25,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 
+private const val TAG = "TelloController"
 private const val TELLO_IP = "192.168.10.1"
 private const val COMMAND_PORT = 8889
 private const val STATE_PORT = 8890
@@ -82,19 +83,46 @@ class TelloController(context: Context) {
 
         _uiState.value = _uiState.value.copy(connection = TelloConnectionState.CONNECTING, lastMessage = "Connexion au drone...")
 
-        wifiBinder.bindToTelloWifi { bound ->
-            if (!bound) {
-                _uiState.value = _uiState.value.copy(connection = TelloConnectionState.FAILED, lastMessage = "Aucun réseau Wi-Fi disponible")
-            } else {
-                scope.launch { openSocketsAndHandshake() }
+        wifiBinder.bindToTelloWifi(
+            onResult = { bound ->
+                if (!bound) {
+                    AppLog.w(TAG, "Aucun réseau Wi-Fi correspondant trouvé (timeout)")
+                    _uiState.value = _uiState.value.copy(
+                        connection = TelloConnectionState.FAILED,
+                        lastMessage = "Connecte le Wi-Fi du téléphone à \"TELLO-...\" puis réessaie"
+                    )
+                } else {
+                    scope.launch { openSocketsAndHandshake() }
+                }
+            },
+            onLost = {
+                // Le téléphone a quitté le Wi-Fi du Tello (ex: reconnexion auto à un autre
+                // réseau enregistré comme "eduroam"). Les sockets existants ne servent plus à
+                // rien : on les ferme pour qu'une reconnexion ultérieure reparte proprement.
+                AppLog.w(TAG, "Wi-Fi du Tello perdu")
+                closeExistingConnection()
+                _uiState.value = _uiState.value.copy(
+                    connection = TelloConnectionState.FAILED,
+                    lastMessage = if (_uiState.value.isFlying) {
+                        "Wi-Fi du drone perdu en plein vol — il atterrira seul sous 15s sans commande. Reconnecte-toi puis réessaie."
+                    } else {
+                        "Wi-Fi du drone perdu (reconnecté à un autre réseau ?) — reconnecte-toi puis réessaie"
+                    }
+                )
             }
-        }
+        )
     }
 
     private suspend fun openSocketsAndHandshake() {
         try {
+            // Une tentative précédente (ex: "Réessayer la connexion") a pu laisser des sockets
+            // ouverts, notamment sur le port fixe 8890 : sans cette fermeture, un nouveau bind sur
+            // ce port échoue avec "EADDRINUSE".
+            closeExistingConnection()
+
             commandSocket = DatagramSocket().apply { soTimeout = 2000 }
             stateSocket = DatagramSocket(STATE_PORT).apply { soTimeout = 2000 }
+            AppLog.d(TAG, "Sockets ouverts, socket commande liée au port local ${commandSocket?.localPort}")
             receiveJob = scope.launch { receiveLoop() }
 
             val response = sendCommandAwaitingResponse("command", timeoutMs = 3000)
@@ -103,12 +131,14 @@ class TelloController(context: Context) {
                 startRcLoop()
                 startBatteryLoop()
             } else {
+                AppLog.w(TAG, "Handshake \"command\" échoué, réponse=$response")
                 _uiState.value = _uiState.value.copy(
                     connection = TelloConnectionState.FAILED,
                     lastMessage = "Pas de réponse du drone (vérifie le Wi-Fi \"TELLO-...\")"
                 )
             }
         } catch (e: Exception) {
+            AppLog.e(TAG, "Erreur lors de l'ouverture des sockets / handshake", e)
             _uiState.value = _uiState.value.copy(connection = TelloConnectionState.FAILED, lastMessage = "Erreur de connexion: ${e.message}")
         }
     }
@@ -116,9 +146,11 @@ class TelloController(context: Context) {
     suspend fun takeoff() {
         if (_uiState.value.connection != TelloConnectionState.CONNECTED || _uiState.value.isFlying) return
 
+        AppLog.d(TAG, "takeoff() demandé")
         _uiState.value = _uiState.value.copy(lastMessage = "Décollage...")
         val response = sendCommandAwaitingResponse("takeoff", timeoutMs = 8000)
         if (!response.equals("ok", ignoreCase = true)) {
+            AppLog.w(TAG, "takeoff() échoué, réponse=$response")
             _uiState.value = _uiState.value.copy(lastMessage = "Échec du décollage (${response ?: "aucune réponse"})")
             return
         }
@@ -128,6 +160,7 @@ class TelloController(context: Context) {
         // dans le flux d'état puis on corrige d'un seul "up"/"down" pour se stabiliser vers 50 cm.
         // Le SDK n'accepte que des déplacements d'au moins 20 cm : en dessous, pas de correction.
         val height = readLatestStateHeightCm(totalTimeoutMs = 2500)
+        AppLog.d(TAG, "Hauteur lue après décollage: ${height ?: "inconnue"} cm")
         if (height != null) {
             val delta = TAKEOFF_TARGET_HEIGHT_CM - height
             when {
@@ -161,11 +194,23 @@ class TelloController(context: Context) {
                 sendRaw("land")
                 delay(300)
             }
-            receiveJob?.cancel()
-            commandSocket?.close()
-            stateSocket?.close()
+            closeExistingConnection()
             wifiBinder.release()
         }
+    }
+
+    /** Ferme sockets et coroutines d'une éventuelle tentative précédente avant d'en ouvrir de nouveaux. */
+    private fun closeExistingConnection() {
+        rcJob?.cancel()
+        rcJob = null
+        batteryJob?.cancel()
+        batteryJob = null
+        receiveJob?.cancel()
+        receiveJob = null
+        commandSocket?.close()
+        commandSocket = null
+        stateSocket?.close()
+        stateSocket = null
     }
 
     private fun startRcLoop() {
@@ -199,35 +244,57 @@ class TelloController(context: Context) {
             try {
                 val packet = DatagramPacket(buffer, buffer.size)
                 socket.receive(packet)
-                pendingResponses.trySend(String(packet.data, 0, packet.length).trim())
+                val text = String(packet.data, 0, packet.length).trim()
+                AppLog.d(TAG, "<- \"$text\" de ${packet.address}:${packet.port}")
+                pendingResponses.trySend(text)
             } catch (_: SocketTimeoutException) {
                 // Normal : on reboucle simplement pour vérifier que le scope est toujours actif.
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                AppLog.e(TAG, "Erreur de réception sur le socket commande", e)
                 if (!scope.isActive) break
             }
         }
     }
 
-    /** Envoie une commande "critique" (command/takeoff/land/battery?) et attend sa réponse. */
+    /**
+     * Envoie une commande "critique" (command/takeoff/land/battery?) et attend sa réponse.
+     * Forcé sur Dispatchers.IO : takeoff()/land() sont appelés depuis l'UI via
+     * rememberCoroutineScope() (thread principal par défaut), et un envoi UDP sur le thread
+     * principal lève NetworkOnMainThreadException.
+     */
     private suspend fun sendCommandAwaitingResponse(command: String, timeoutMs: Long): String? =
-        criticalSendMutex.withLock {
-            rcPaused = true
-            try {
-                while (pendingResponses.tryReceive().isSuccess) { /* purge une réponse obsolète */ }
-                sendRaw(command)
-                withTimeoutOrNull(timeoutMs) { pendingResponses.receive() }
-            } finally {
-                rcPaused = false
+        withContext(Dispatchers.IO) {
+            criticalSendMutex.withLock {
+                rcPaused = true
+                try {
+                    // Laisse le temps à un éventuel "ok" encore en vol, émis par une trame "rc"
+                    // envoyée juste avant la pause, d'arriver avant de purger : sinon il pourrait
+                    // être confondu avec la réponse de la commande qu'on s'apprête à envoyer.
+                    delay(RC_INTERVAL_MS + 50)
+                    while (pendingResponses.tryReceive().isSuccess) { /* purge une réponse obsolète */ }
+                    sendRaw(command)
+                    val result = withTimeoutOrNull(timeoutMs) { pendingResponses.receive() }
+                    if (result == null) AppLog.w(TAG, "Timeout (${timeoutMs}ms) en attente de la réponse à \"$command\"")
+                    result
+                } finally {
+                    rcPaused = false
+                }
             }
         }
 
     private fun sendRaw(command: String) {
-        val socket = commandSocket ?: return
+        val socket = commandSocket
+        if (socket == null) {
+            AppLog.w(TAG, "sendRaw(\"$command\") ignoré : socket commande non initialisé")
+            return
+        }
         try {
             val bytes = command.toByteArray()
             socket.send(DatagramPacket(bytes, bytes.size, telloAddress, COMMAND_PORT))
-        } catch (_: Exception) {
-            // Échec ponctuel d'envoi : la boucle rc ou l'appelant retenteront au prochain cycle.
+            // Les trames "rc" partent à 10 Hz : ne pas les journaliser pour ne pas noyer les logs.
+            if (!command.startsWith("rc ")) AppLog.d(TAG, "-> \"$command\"")
+        } catch (e: Exception) {
+            AppLog.e(TAG, "Échec d'envoi de \"$command\"", e)
         }
     }
 
